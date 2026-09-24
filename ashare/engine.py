@@ -94,7 +94,7 @@ class AlphaEngine:
         n = self.features.shape[0]
         scores = torch.zeros((seqs.shape[0], n, len(date_subset)),
                              dtype=torch.float32, device=DEVICE)
-        status = torch.zeros(seqs.shape[0], dtype=torch.int8)   # 0 合法 / 1 非法 / 2 常量
+        status = torch.zeros(seqs.shape[0], dtype=torch.int8, device=DEVICE)   # 0 合法 / 1 非法 / 2 常量
         cols = torch.as_tensor(date_subset, dtype=torch.long, device=DEVICE)
         for i in range(seqs.shape[0]):
             res = self.vm.execute(seqs[i].tolist(), self.features)

@@ -3,6 +3,10 @@
 #
 # 安装：pip install -r requirements.txt
 # 默认走官方 PyPI；Windows 下 PyPI 的 torch 即 CPU 版，无需额外索引。
+#
+# GPU 训练（CUDA 12.6）建议：官方源单流下载常被限速，用 SJTU 镜像直连快 ~10x：
+#   pip install torch==2.9.1+cu126 -f https://mirror.sjtu.edu.cn/pytorch-wheels/cu126/
+# （该镜像目录非标准 simple index，-f find-links 方式可用）
 
 # 深度学习与数值计算
 torch>=2.0
