@@ -2,9 +2,7 @@
 # Python 3.13（与 gm SDK 对齐）
 #
 # 安装：pip install -r requirements.txt
-# 注意：本机清华镜像若不可达，torch 需走官方 CPU 源：
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-# 其余包走官方 PyPI：--index-url https://pypi.org/simple
+# 默认走官方 PyPI；Windows 下 PyPI 的 torch 即 CPU 版，无需额外索引。
 
 # 深度学习与数值计算
 torch>=2.0
