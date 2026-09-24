@@ -27,6 +27,13 @@ ILLEGAL_REWARD = -5.0         # 非法公式（栈机执行失败）
 CONSTANT_REWARD = -2.0        # 输出近常量（无截面区分度）
 SEED = 42
 
+# ---- Phase 2：契约对齐 ----
+TRAIN_END = "2024-01-01"      # 时间外切分：网格日 < TRAIN_END 为训练段，>= 为样本外段
+NEUTRALIZE = True             # reward 内启用中性化链（MAD→z→行业+log市值→残差z）
+WINSOR_MAD_CLIP = 3.0         # MAD 去极值倍数
+REWARD_MODE = "ic"            # "ic" | "icir" | "ic+icir"（训练 reward 口径）
+COST_ROUND_TRIP_PCT = 0.30    # 双边换手成本（佣金+印花税+冲击，百分比），净分层用
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- 产物与缓存路径 ----

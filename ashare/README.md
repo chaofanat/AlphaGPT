@@ -34,10 +34,26 @@ pytest ashare/tests -v                         # 单测（红线/VM/评估器/�
 | `features.py` | 6 原子（REV5/BIAS60/TURNOVER/VRATIO/VOL20/EP）+ 截面 robust-z |
 | `materialize.py` | 面板物化（训练/评估唯一数据入口） |
 | `ops.py` / `vocab.py` / `vm.py` | 12 算子 + 词表 + 栈机（自 model_core 移植） |
-| `evaluator.py` | 截面 RankIC reward（torch 平均秩，与 scipy.spearmanr 对账） |
+| `preprocess.py` | 中性化链（MAD→z→申万行业+log市值→残差z），Phase 2 |
+| `evaluator.py` | 截面 RankIC / ICIR / 五分位分层（torch 平均秩，与 scipy 对账） |
 | `alphagpt.py` / `engine.py` | 生成器 + REINFORCE（含 LoRD 正则，自 model_core 移植） |
 
-## Phase 边界（本期不做）
+## Phase 2 已落地（契约对齐）
 
-中性化链进 reward、ICIR/分层/成本、时间外切分（Phase 2）；
-因子池注册与 (symbol,date)→value 导出（Phase 3）。
+- **中性化链进 reward**：公式分数在 IC 计算前过 MAD 去极值 → z → 申万一级行业
+  + log 总市值截面回归取残差 → 残差 z；行业/市值 beta 无法得分
+  （`tests/test_preprocess.py` 三块试金石：纯 beta 杀死 / 混合信号保留）
+- **指标族**：IC 均值、ICIR、五分位 top-bottom 分层、扣双边成本（默认 0.3%）
+  的净分层；训练 reward 口径可配（`REWARD_MODE = ic | icir | ic+icir`）
+- **时间外纪律**：网格日 < `TRAIN_END`（默认 2024-01-01）才进训练 reward；
+  终选 top-K 按**样本外 ICIR** 裁决，报告 train/test 两段全部指标
+  （`ashare/output/best_ashare_formula.json` 的 `metrics` 块）
+
+注意：终选在样本外段上做选择，对 81 个测试日存在轻微选择偏差；严格评估
+需保留一段从未参与任何决策的最终 holdout（留给 Phase 3 治理接入时加）。
+
+## Phase 边界（未做）
+
+- HOLDER（股东户数）/ ROE 族原子扩词表 —— Phase 2.5（需 asof 对齐）
+- 训练提速（批量 VM / GPU）—— 按需（CPU ~15-35s/步）
+- 因子池注册与 (symbol,date)→value 导出、独立 holdout —— Phase 3

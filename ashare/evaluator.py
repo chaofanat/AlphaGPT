@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""截面 RankIC 评估器（Phase 1 朴素版 reward）。
+"""截面 RankIC 评估器（Phase 2：中性化链 + ICIR/分层 + 分段裁决）。
 
-公式输出 [N, Tg] → 逐网格日：池内 ∩ 标签有效 的 Spearman 秩相关
-（对 t8 池内超额收益）→ 所选网格日的均值。
+公式输出 [N, Tg] → 逐网格日：池内 ∩ 标签有效 子集上，分数过中性化链
+（MAD→z→行业+log市值→残差z，可选）后与 t8 池内超额做 Spearman 秩相关。
 
 秩相关用 torch 平均秩（并列取平均）实现，与 scipy.stats.spearmanr 数值
 一致（tests/test_evaluator.py 对账）；标签秩在初始化时一次性预计算。
@@ -10,8 +10,7 @@
 import numpy as np
 import torch
 
-from .config import MIN_POOL_IC
-
+from .config import DEVICE, MIN_POOL_IC, NEUTRALIZE, REWARD_MODE
 
 def avg_rank(x: torch.Tensor) -> torch.Tensor:
     """沿 dim=1 升序赋 1..n 的平均秩；NaN/Inf 位秩为 NaN。x: [B, N]。"""
@@ -52,11 +51,25 @@ def _pearson(a: torch.Tensor, b: torch.Tensor, min_n: int) -> torch.Tensor:
     return torch.where(cnt >= min_n, ic, torch.full_like(ic, float("nan")))
 
 
-class ICEvaluator:
-    """从物化面板构建 IC 评估器。labels NaN 与 mask 外的样本不参与。"""
+def icir(ics: torch.Tensor) -> torch.Tensor:
+    """IC 序列的均值/标准差（沿最后一维；全 NaN 或零方差安全）。"""
+    ok = torch.isfinite(ics)
+    cnt = ok.sum(dim=-1).clamp(min=1)
+    mean = torch.where(ok, ics, torch.zeros_like(ics)).sum(dim=-1) / cnt
+    d = torch.where(ok, ics - mean[..., None], torch.zeros_like(ics))
+    std = torch.sqrt((d * d).sum(dim=-1) / cnt)
+    val = mean / (std + 1e-9)
+    return torch.where(cnt > 0, val, torch.full_like(val, float("nan")))
 
-    def __init__(self, features, labels, mask, device=None):
-        from .config import DEVICE
+
+class ICEvaluator:
+    """从物化面板构建 IC 评估器。labels NaN 与 mask 外的样本不参与。
+
+    industry / log_mktcap 传入（面板原数组）且 neutralize 开启时，分数在
+    IC 计算前过中性化链（见 preprocess.py）。"""
+
+    def __init__(self, features, labels, mask, industry=None, log_mktcap=None,
+                 neutralize=None, device=None):
         self.device = device or DEVICE
         self.features = torch.as_tensor(features, dtype=torch.float32, device=self.device)
         labels = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
@@ -75,6 +88,23 @@ class ICEvaluator:
         self.usable_dates = [t for t, idx in enumerate(self.date_idx)
                              if idx.numel() >= MIN_POOL_IC]
 
+        self.neut = None
+        use_neut = NEUTRALIZE if neutralize is None else neutralize
+        if use_neut and industry is not None:
+            from .preprocess import CrossSectionNeutralizer
+            self.neut = CrossSectionNeutralizer(industry, log_mktcap,
+                                                self.valid.cpu().numpy(),
+                                                device=self.device)
+
+    # ---- 核心：单日 IC ----
+
+    def _day_ic(self, s: torch.Tensor, t: int) -> torch.Tensor:
+        """s [B, V]（该日有效子集分数）→ [B] Spearman IC（分数过中性化链）。"""
+        if self.neut is not None:
+            s = self.neut.apply(s, t)
+        e = self.label_rank[self.date_idx[t], t].unsqueeze(0).expand(s.shape[0], -1)
+        return _pearson(avg_rank(s), e, MIN_POOL_IC)
+
     def ic_series(self, scores, dates=None) -> torch.Tensor:
         """scores [B, N, Tg]（或 [N, Tg]）→ 各日 IC [B, D]（无效日 NaN）。"""
         single = scores.dim() == 2
@@ -82,37 +112,67 @@ class ICEvaluator:
         use = self.usable_dates if dates is None else dates
         out = torch.full((sc.shape[0], len(use)), float("nan"), device=self.device)
         for k, t in enumerate(use):
-            idx = self.date_idx[t]
-            s = sc[:, idx, t]                                # [B, V]
-            e = self.label_rank[idx, t].unsqueeze(0).expand(sc.shape[0], -1)
-            out[:, k] = _pearson(avg_rank(s), e, MIN_POOL_IC)
+            out[:, k] = self._day_ic(sc[:, self.date_idx[t], t], t)
         return out.squeeze(0) if single else out
 
-    def evaluate(self, scores, dates=None) -> torch.Tensor:
-        """scores [B, N, Tg] → reward [B]（所选日期 IC 均值，全 NaN 日期则 -10）。"""
-        ics = self.ic_series(scores, dates)
-        nan_mask = torch.isfinite(ics)
-        denom = nan_mask.sum(dim=1).clamp(min=1)
-        mean_ic = torch.where(nan_mask, ics, torch.zeros_like(ics)).sum(dim=1) / denom
-        return torch.where(torch.isfinite(mean_ic), mean_ic,
-                           torch.full_like(mean_ic, -10.0))
-
-    def evaluate_columns(self, scores, dates) -> torch.Tensor:
-        """scores [B, N, len(dates)]，最后一维与 dates（原始日期索引）对齐 → reward [B]。
+    def ics_columns(self, scores, dates) -> torch.Tensor:
+        """scores [B, N, len(dates)]，最后一维与 dates（原始日期索引）对齐 → [B, D]。
 
         训练主循环只为抽中的日期子集执行栈机/保留分数，走此入口省内存。"""
         B = scores.shape[0]
-        ics = torch.full((B, len(dates)), float("nan"), device=self.device)
+        out = torch.full((B, len(dates)), float("nan"), device=self.device)
         for k, t in enumerate(dates):
+            out[:, k] = self._day_ic(scores[:, self.date_idx[t], k], t)
+        return out
+
+    # ---- reward 与报告指标 ----
+
+    def reward_on_columns(self, scores, dates, mode=None) -> torch.Tensor:
+        """按 REWARD_MODE 聚合各日 IC → reward [B]；全 NaN 行 -10。"""
+        mode = mode or REWARD_MODE
+        ics = self.ics_columns(scores, dates)
+        ok = torch.isfinite(ics)
+        cnt = ok.sum(dim=1).clamp(min=1)
+        mean = torch.where(ok, ics, torch.zeros_like(ics)).sum(dim=1) / cnt
+        if mode == "icir":
+            rew = icir(ics)
+        elif mode == "ic+icir":
+            rew = mean + icir(ics)
+        else:                                                # "ic"
+            rew = mean
+        return torch.where(torch.isfinite(rew), rew, torch.full_like(rew, -10.0))
+
+    def evaluate(self, scores, dates=None) -> torch.Tensor:
+        """scores [B, N, Tg] → mean IC [B]（兼容入口，等价 mode='ic'）。"""
+        ics = self.ic_series(scores, dates)
+        ok = torch.isfinite(ics)
+        mean = torch.where(ok, ics, torch.zeros_like(ics)).sum(dim=1) / ok.sum(dim=1).clamp(min=1)
+        return torch.where(torch.isfinite(mean), mean, torch.full_like(mean, -10.0))
+
+    def evaluate_columns(self, scores, dates) -> torch.Tensor:
+        """evaluate 的日期子列版（Phase 1 兼容入口，mean IC）。"""
+        ics = self.ics_columns(scores, dates)
+        ok = torch.isfinite(ics)
+        mean = torch.where(ok, ics, torch.zeros_like(ics)).sum(dim=1) / ok.sum(dim=1).clamp(min=1)
+        return torch.where(torch.isfinite(mean), mean, torch.full_like(mean, -10.0))
+
+    @torch.no_grad()
+    def layer_spread(self, scores, dates) -> float:
+        """五分位 top-bottom 平均池内超额（百分比），对 dates 取均值。
+
+        scores [N, Tg] 单公式全日期分数；排序在原始分数上（中性化不改变
+        单调变换下的分层——如启用中性化，此处与 IC 口径一致的秩）。"""
+        spreads = []
+        for t in dates:
             idx = self.date_idx[t]
-            s = scores[:, idx, k]                        # [B, V]
-            e = self.label_rank[idx, t].unsqueeze(0).expand(B, -1)
-            ics[:, k] = _pearson(avg_rank(s), e, MIN_POOL_IC)
-        nan_mask = torch.isfinite(ics)
-        denom = nan_mask.sum(dim=1).clamp(min=1)
-        mean_ic = torch.where(nan_mask, ics, torch.zeros_like(ics)).sum(dim=1) / denom
-        return torch.where(torch.isfinite(mean_ic), mean_ic,
-                           torch.full_like(mean_ic, -10.0))
+            s = scores[idx, t]
+            if self.neut is not None:
+                s = self.neut.apply(s.unsqueeze(0), t).squeeze(0)
+            e = self.excess[idx, t]
+            r = torch.argsort(torch.argsort(s)).float()
+            q = torch.clamp((r / len(idx) * 5).long(), 0, 4)
+            spreads.append((e[q == 4].mean() - e[q == 0].mean()).item())
+        return float(np.nanmean(spreads)) if spreads else float("nan")
 
 
 def evaluator_from_panel(panel=None):
@@ -120,4 +180,5 @@ def evaluator_from_panel(panel=None):
     if panel is None:
         from .materialize import load_panel
         panel = load_panel()
-    return ICEvaluator(panel["features"], panel["labels"], panel["mask"])
+    return ICEvaluator(panel["features"], panel["labels"], panel["mask"],
+                       industry=panel["industry"], log_mktcap=panel["log_mktcap"])

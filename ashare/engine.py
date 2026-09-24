@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
-"""REINFORCE 训练引擎（自 model_core/engine.py 移植并适配截面评估）。
+"""REINFORCE 训练引擎（自 model_core/engine.py 移植并适配截面评估，Phase 2）。
 
 与原版的差异：
 - 数据入口：Postgres → 物化 npz 面板（ashare/materialize.py）
-- reward：单币 PnL 回测 → 网格日截面 RankIC 均值（池内超额，ashare/evaluator.py）
+- reward：单币 PnL 回测 → 网格日截面 RankIC（池内超额；Phase 2 起分数先过
+  中性化链——MAD→z→行业+log市值→残差z，见 ashare/preprocess.py）
 - 成本控制：截面 RankIC 含排序，每步随机抽 DATES_PER_STEP 个网格日估 reward
-  （REINFORCE 本就是随机估计，日期子样可接受）；终评用全日期。
+  （REINFORCE 本就随机，日期子样可接受）
+- 时间外纪律（Phase 2 核心）：网格日 < TRAIN_END 才进入训练 reward；
+  终选 top-K 按样本外段（>= TRAIN_END）的 ICIR 裁决，样本内指标仅作参考。
 
-REINFORCE 主循环不变：批量采样公式 → 栈机执行 → 回测/IC 评分 →
+REINFORCE 主循环不变：批量采样公式 → 栈机执行 → IC 评分 →
 advantage 归一化加权 log-prob → AdamW 更新 + LoRD 低秩衰减。
 """
 import json
@@ -19,15 +22,15 @@ from torch.distributions import Categorical
 from tqdm import tqdm
 
 from .alphagpt import AlphaGPT, NewtonSchulzLowRankDecay
-from .config import (BATCH_SIZE, CONSTANT_REWARD, DATES_PER_STEP, DEVICE,
-                     ILLEGAL_REWARD, MAX_FORMULA_LEN, OUTPUT_DIR, SEED,
-                     TRAIN_STEPS)
-from .evaluator import ICEvaluator
+from .config import (BATCH_SIZE, CONSTANT_REWARD, COST_ROUND_TRIP_PCT,
+                     DATES_PER_STEP, DEVICE, ILLEGAL_REWARD, MAX_FORMULA_LEN,
+                     OUTPUT_DIR, REWARD_MODE, SEED, TRAIN_END, TRAIN_STEPS)
+from .evaluator import ICEvaluator, icir
 from .materialize import load_panel
 from .vocab import FORMULA_VOCAB
 from .vm import StackVM
 
-TOP_K = 16          # 终评候选数（按逐步 reward 保留的 top-K 公式再全日期评估）
+TOP_K = 16          # 终评候选数（按逐步 reward 保留的 top-K 公式再分段评估）
 
 
 class AlphaEngine:
@@ -40,9 +43,17 @@ class AlphaEngine:
         panel = load_panel()
         self.features = torch.as_tensor(panel["features"], dtype=torch.float32,
                                         device=DEVICE)     # [N, F, Tg]
-        self.evaluator = ICEvaluator(self.features, panel["labels"], panel["mask"])
+        self.evaluator = ICEvaluator(self.features, panel["labels"], panel["mask"],
+                                     industry=panel["industry"],
+                                     log_mktcap=panel["log_mktcap"])
         self.grid_dates = list(panel["grid_dates"])
         self.symbols = list(panel["symbols"])
+
+        # 时间外切分：训练段供 REINFORCE 采样，样本外段只参与终选裁决
+        self.train_dates = [t for t in self.evaluator.usable_dates
+                            if self.grid_dates[t] < TRAIN_END]
+        self.test_dates = [t for t in self.evaluator.usable_dates
+                           if self.grid_dates[t] >= TRAIN_END]
 
         self.model = AlphaGPT().to(DEVICE)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=1e-3)
@@ -97,7 +108,7 @@ class AlphaEngine:
         return scores, status
 
     def _step_reward(self, scores, status, date_subset):
-        rewards = self.evaluator.evaluate_columns(scores, date_subset)
+        rewards = self.evaluator.reward_on_columns(scores, date_subset)
         rewards = torch.where(status == 1, torch.full_like(rewards, ILLEGAL_REWARD), rewards)
         rewards = torch.where(status == 2, torch.full_like(rewards, CONSTANT_REWARD), rewards)
         return rewards
@@ -106,12 +117,14 @@ class AlphaEngine:
 
     def train(self, steps=TRAIN_STEPS, verbose=True):
         print(f"🚀 A股截面因子挖掘启动（device={DEVICE}, batch={BATCH_SIZE}, "
-              f"dates/step={DATES_PER_STEP}, 词表={FORMULA_VOCAB.size} tokens）")
-        usable = self.evaluator.usable_dates
+              f"dates/step={DATES_PER_STEP}, 词表={FORMULA_VOCAB.size} tokens, "
+              f"reward={REWARD_MODE}, 中性化={'on' if self.evaluator.neut else 'off'}, "
+              f"切分={len(self.train_dates)}train/{len(self.test_dates)}test @ {TRAIN_END}）")
         pbar = tqdm(range(steps), disable=not verbose)
         for step in pbar:
             seqs, log_probs = self._sample_batch()
-            date_subset = random.sample(usable, min(DATES_PER_STEP, len(usable)))
+            date_subset = random.sample(self.train_dates,
+                                        min(DATES_PER_STEP, len(self.train_dates)))
 
             scores, status = self._execute_batch(seqs, date_subset)
             rewards = self._step_reward(scores, status, date_subset)
@@ -146,38 +159,61 @@ class AlphaEngine:
 
     @torch.no_grad()
     def _finalize(self):
-        """全日期终评 top-K，落盘最优公式与训练历史。"""
+        """top-K 分段终评：样本外（>= TRAIN_END）ICIR 裁决，落盘最优公式与指标。"""
         if not self.top_formulas:
             print("⚠️ 未产生任何合法公式")
             return
-        self.top_formulas = sorted(self.top_formulas, key=lambda x: -x[0])
         seen, candidates = set(), []
-        for rew, formula in self.top_formulas:
+        for rew, formula in sorted(self.top_formulas, key=lambda x: -x[0]):
             key = tuple(formula)
             if key not in seen:
                 seen.add(key)
                 candidates.append(formula)
 
-        best = None
+        reports = []
         for formula in candidates:
             res = self.vm.execute(formula, self.features)
             if res is None:
                 continue
-            ic = float(torch.nanmean(self.evaluator.ic_series(res.unsqueeze(0))))
-            if best is None or ic > best[1]:
-                best = (formula, ic)
-
-        if best is None:
+            rep = self._segment_report(res)
+            if rep is not None:
+                reports.append((formula, rep))
+        if not reports:
             print("⚠️ top-K 公式终评全部失败")
             return
-        self.best_formula, self.best_score = best
+
+        # 裁决序：样本外 ICIR > 样本外 IC > 样本内 ICIR（无样本外段时的降级链）
+        def verdict(rep):
+            te, tr = rep["test"], rep["train"]
+            if te["n"] > 0:
+                return (te["icir"], te["ic"])
+            return (tr["icir"], tr["ic"])
+
+        reports.sort(key=lambda fr: verdict(fr[1]), reverse=True)
+        self.best_formula, best_rep = reports[0]
+        self.best_score = best_rep["test"]["ic"] if best_rep["test"]["n"] > 0 \
+            else best_rep["train"]["ic"]
+
+        print("\n==== 终评分段报告（按样本外 ICIR 排序）====")
+        print(f"{'公式':<58}{'train IC':>9}{'ICIR':>7}{'test IC':>9}{'ICIR':>7}"
+              f"{'净分层%':>8}")
+        for formula, rep in reports:
+            names = " ".join(FORMULA_VOCAB.formula_to_names(formula))
+            te, tr = rep["test"], rep["train"]
+            net = (te["layer_spread"] - COST_ROUND_TRIP_PCT) if te["n"] > 0 else float("nan")
+            print(f"{names[:57]:<58}{tr['ic']:>9.4f}{tr['icir']:>7.2f}"
+                  f"{te['ic']:>9.4f}{te['icir']:>7.2f}{net:>8.2f}")
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "formula_ids": self.best_formula,
             "formula": FORMULA_VOCAB.formula_to_names(self.best_formula),
-            "in_sample_ic": self.best_score,
-            "dates_evaluated": len(self.evaluator.usable_dates),
+            "selection": "test_icir" if best_rep["test"]["n"] > 0 else "train_icir",
+            "reward_mode": REWARD_MODE,
+            "neutralized": self.evaluator.neut is not None,
+            "train_end": TRAIN_END,
+            "cost_round_trip_pct": COST_ROUND_TRIP_PCT,
+            "metrics": best_rep,
             "feature_names": list(FORMULA_VOCAB.feature_names),
             "operator_names": list(FORMULA_VOCAB.operator_names),
         }
@@ -185,8 +221,27 @@ class AlphaEngine:
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         (OUTPUT_DIR / "training_history.json").write_text(
             json.dumps(self.training_history, ensure_ascii=False), encoding="utf-8")
-        print(f"✓ 训练完成 | 最优公式: {' '.join(payload['formula'])} "
-              f"| 全日期样本内 IC: {self.best_score:.4f}")
+        te, tr = best_rep["test"], best_rep["train"]
+        print(f"✓ 训练完成 | 最优公式: {' '.join(payload['formula'])}")
+        print(f"  样本内({tr['n']}日): IC {tr['ic']:.4f} / ICIR {tr['icir']:.2f} | "
+              f"样本外({te['n']}日): IC {te['ic']:.4f} / ICIR {te['icir']:.2f}")
+
+    @torch.no_grad()
+    def _segment_report(self, scores_full) -> dict | None:
+        """单公式分段指标：train/test 各段 IC 均值、ICIR、五分位分层。"""
+        def seg(dates):
+            if not dates:
+                return {"n": 0, "ic": float("nan"), "icir": float("nan"),
+                        "layer_spread": float("nan")}
+            ics = self.evaluator.ic_series(scores_full.unsqueeze(0), dates=dates)[0]
+            ok = torch.isfinite(ics)
+            n = int(ok.sum())
+            ic = float(ics[ok].mean()) if n else float("nan")
+            ir = float(icir(ics)) if n else float("nan")
+            spread = self.evaluator.layer_spread(scores_full, dates)
+            return {"n": n, "ic": ic, "icir": ir, "layer_spread": spread}
+
+        return {"train": seg(self.train_dates), "test": seg(self.test_dates)}
 
 
 if __name__ == "__main__":
