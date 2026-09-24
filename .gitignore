@@ -57,8 +57,9 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Code index (local tooling)
+# Code index / local tooling
 .codegraph/
+.zcode/
 
 # A股挖掘缓存与产物
 ashare/cache/
