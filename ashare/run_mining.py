@@ -20,9 +20,10 @@ def cmd_materialize(args):
 
 
 def cmd_train(args):
+    from .config import TRAIN_STEPS
     from .engine import AlphaEngine
     eng = AlphaEngine(use_lord_regularization=not args.no_lord)
-    eng.train(steps=args.steps)
+    eng.train(steps=args.steps if args.steps is not None else TRAIN_STEPS)
 
 
 def cmd_inspect(_args):
