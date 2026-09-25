@@ -16,9 +16,10 @@ Transformer 采样公式 token 序列 → StackVM 在 [N 股票, T 网格日] �
 ```bash
 python -m ashare.run_mining materialize        # GMtest 缓存 → ashare/cache/panel.npz
 python -m ashare.run_mining train --steps 50   # 短跑验证；完整训练默认 1000 步
+python -m ashare.run_mining export             # 过门槛候选 → 因子定义包（output/packages/）
 python -m ashare.run_mining inspect            # 面板/产物概况
 python -m ashare.scripts.validate_vs_gmtest    # 与课题采样池缓存对账（只读）
-pytest ashare/tests -v                         # 单测（红线/VM/评估器/数据试金石）
+pytest ashare/tests -v                         # 单测（红线/VM/评估器/数据/导出试金石）
 ```
 
 依赖：torch / pandas / pyarrow / gm / scipy / tqdm / pytest（见仓库根安装）。
@@ -35,8 +36,12 @@ pytest ashare/tests -v                         # 单测（红线/VM/评估器/�
 | `materialize.py` | 面板物化（训练/评估唯一数据入口） |
 | `ops.py` / `vocab.py` / `vm.py` | 12 算子 + 词表 + 栈机（自 model_core 移植） |
 | `preprocess.py` | 中性化链（MAD→z→申万行业+log市值→残差z），Phase 2 |
-| `evaluator.py` | 截面 RankIC / ICIR / 五分位分层（torch 平均秩，与 scipy 对账） |
+| `evaluator.py` | 截面 RankIC / ICIR / t / 分层（torch 平均秩，与 scipy 对账） |
 | `alphagpt.py` / `engine.py` | 生成器 + REINFORCE（含 LoRD 正则，自 model_core 移植） |
+| `export.py` | 因子定义包导出（Phase 3：参考面板 + expected 对账靶 + 自检） |
+
+方法定稿（出生检验/入池生活两阶段、交付契约、分工边界）见
+[DESIGN.md](DESIGN.md)。
 
 ## Phase 2 已落地（契约对齐）
 

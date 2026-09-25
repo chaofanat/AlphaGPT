@@ -26,6 +26,11 @@ def cmd_train(args):
     eng.train(steps=args.steps if args.steps is not None else TRAIN_STEPS)
 
 
+def cmd_export(args):
+    from .export import export_packages
+    export_packages(limit=args.limit)
+
+
 def cmd_inspect(_args):
     import numpy as np
     if not PANEL_PATH.exists():
@@ -56,6 +61,10 @@ def main():
     p_train.add_argument("--steps", type=int, default=None)
     p_train.add_argument("--no-lord", action="store_true", help="关闭 LoRD 正则")
     p_train.set_defaults(func=cmd_train)
+
+    p_exp = sub.add_parser("export", help="导出过门槛因子的定义包")
+    p_exp.add_argument("--limit", type=int, default=None, help="最多导出前 N 条")
+    p_exp.set_defaults(func=cmd_export)
 
     p_ins = sub.add_parser("inspect", help="查看面板/产物")
     p_ins.set_defaults(func=cmd_inspect)
