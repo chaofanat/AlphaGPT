@@ -21,6 +21,7 @@ expected.npz 断言 allclose(atol=1e-4)。导出时本侧用同一机制自检�
 """
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -200,6 +201,15 @@ def export_packages(candidates=None, panel=None, out_dir=None, limit=None):
         exported.append((name, ids))
 
     print(f"✓ 导出 {len(exported)} 个定义包 → {out_dir}")
+    # 剪除历史导出残留（只清本次未产出的公式包，参考面板在下方统一重写）
+    exported_names = {name for name, _ in exported}
+    pruned = 0
+    for d in out_dir.glob("ashare_formula_*"):
+        if d.name not in exported_names:
+            shutil.rmtree(d)
+            pruned += 1
+    if pruned:
+        print(f"  已清理 {pruned} 个过期残留包")
     print(f"  参考网格日: {[grid[t] for t in ref_idx]}（池口径中性化，自检通过）")
     return exported
 
