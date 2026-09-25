@@ -70,7 +70,8 @@ class AlphaEngine:
         self.vm = StackVM()
         self.best_score = -float("inf")
         self.best_formula = None
-        self.top_formulas = []            # [(reward, formula)] 维护 top-K
+        self._top_by_formula = {}         # {formula_tuple: 最高抽样 reward}
+        self.top_formulas = []            # [(formula, reward)] 去重后 top-K
         self.training_history = {"step": [], "avg_reward": [], "best_score": []}
 
     # ---- 采样与评估 ----
@@ -139,18 +140,22 @@ class AlphaEngine:
                 self.lord_opt.step()
 
             # top-K 追踪（按抽样 reward；终评用全日期纠正抽样噪声）
+            # 按公式去重保留最高分：同一公式的多次幸运抽样不得挤占多个榜位
             order = torch.argsort(rewards, descending=True)
             for i in order[:TOP_K].tolist():
                 if status[i] != 0:
                     continue
-                formula = seqs[i].tolist()
-                self.top_formulas.append((float(rewards[i]), formula))
-            self.top_formulas = sorted(self.top_formulas, key=lambda x: -x[0])[:TOP_K]
+                formula = tuple(seqs[i].tolist())
+                rew = float(rewards[i])
+                if rew > self._top_by_formula.get(formula, -float("inf")):
+                    self._top_by_formula[formula] = rew
+            self.top_formulas = sorted(self._top_by_formula.items(),
+                                       key=lambda kv: -kv[1])[:TOP_K]
 
             self.training_history["step"].append(step)
             self.training_history["avg_reward"].append(float(rewards.mean()))
             self.training_history["best_score"].append(
-                self.top_formulas[0][0] if self.top_formulas else float("nan"))
+                self.top_formulas[0][1] if self.top_formulas else float("nan"))
             pbar.set_postfix({"AvgRew": f"{rewards.mean():.4f}",
                               "TopIC": f"{self.training_history['best_score'][-1]:.4f}"})
 
@@ -163,12 +168,7 @@ class AlphaEngine:
         if not self.top_formulas:
             print("⚠️ 未产生任何合法公式")
             return
-        seen, candidates = set(), []
-        for rew, formula in sorted(self.top_formulas, key=lambda x: -x[0]):
-            key = tuple(formula)
-            if key not in seen:
-                seen.add(key)
-                candidates.append(formula)
+        candidates = [formula for formula, _ in self.top_formulas]  # 榜内已按公式去重
 
         reports = []
         for formula in candidates:
