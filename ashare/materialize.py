@@ -20,7 +20,8 @@ from .config import CACHE_DIR, META_PATH, PANEL_PATH
 from .features import FEATURE_NAMES, build_grid_features, daily_features, ep_panel
 from .gm_bridge import (_norm_eob, get_history_with_today,
                         get_industry_sw_cached, get_mktcap_cached,
-                        get_valuation_cached, load_snapshots)
+                        get_valuation_cached, load_snapshots,
+                        research_anchor)
 from .labels import label_panel
 from .universe import build_pools
 
@@ -69,8 +70,13 @@ def materialize(end_date=None, verbose=True):
     log(f"并集股票池: {len(symbols)} 只（网格日快照过滤后的 union）")
 
     # ---- 日线（全部走 GMtest 磁盘缓存；缺失段自动网络补拉）----
+    # 研究代锚（GMtest docs/ADJUSTMENT_ANCHOR.md）：BAR_FIELDS 不复权、原子
+    # 全用 close/pre_close 链（锚免疫）——进锚上下文是纪律性防御，未来任何
+    # ADJUST_PREV 读取自动落在代锚上，物化面板 vintage 确定
     log("Step 2/5: 拉取日线面板（OHLC + pre_close + amount）...")
-    bars = get_history_with_today(symbols, fetch_start, end, fields=BAR_FIELDS)
+    with research_anchor(end):
+        bars = get_history_with_today(symbols, fetch_start, end,
+                                      fields=BAR_FIELDS)
     if bars is None or bars.empty:
         raise RuntimeError("日线面板为空：请确认 GMtest 缓存/网络")
     bars["eob"] = _norm_eob(bars["eob"])

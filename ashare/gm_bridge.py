@@ -24,7 +24,8 @@ if str(GMTEST_HOME) not in sys.path:
     sys.path.insert(0, str(GMTEST_HOME))
 
 # ---- 统一转引（调用点保持一行 import）----
-from utils.gm_data import get_history_with_today, last_closed_date, _norm_eob  # noqa: E402,F401
+from utils.gm_data import (get_history_with_today, last_closed_date,  # noqa: E402,F401
+                           _norm_eob, research_anchor)
 from utils.market_data import (load_snapshots,  # noqa: E402,F401
                                get_industry_sw_cached, get_mktcap_cached)
 from utils.trading_day import get_trading_calendar  # noqa: E402,F401
