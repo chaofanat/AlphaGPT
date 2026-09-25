@@ -34,6 +34,14 @@ WINSOR_MAD_CLIP = 3.0         # MAD 去极值倍数
 REWARD_MODE = "ic"            # "ic" | "icir" | "ic+icir"（训练 reward 口径）
 COST_ROUND_TRIP_PCT = 0.30    # 双边换手成本（佣金+印花税+冲击，百分比），净分层用
 
+# ---- Phase 3：出生检验门槛（样本外段一次性判定，搜索全程不可见）----
+# 依据见 DESIGN.md：候选不搞 16 选 1，逐条过门槛后全部交付。
+BIRTH_MIN_IC = 0.02          # 样本外 IC 均值下限
+BIRTH_MIN_TSTAT = 2.0        # 样本外 t 统计量下限（≈ ICIR×√n；日期间隔=持有期，
+                             #   无重叠窗口，普通 t 即可，NW 修正近似恒等）
+BIRTH_YEARLY_WIN_MIN = 2     # 样本外分年 IC 为正的最少年数（2024/25/26 共 3 年）
+BIRTH_MIN_MONO = 0.8         # 五分位单调性（层序×层均收益 Spearman）下限
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- 产物与缓存路径 ----

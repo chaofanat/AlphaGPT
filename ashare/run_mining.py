@@ -37,11 +37,11 @@ def cmd_inspect(_args):
           f"({data['grid_dates'][0]} ~ {data['grid_dates'][-1]})")
     print(f"池均 {mask.sum() / mask.shape[1]:.0f} 只 | "
           f"标签有效率 {np.isfinite(labels[mask]).mean():.1%}")
-    for name in ("best_ashare_formula.json", "training_history.json"):
+    for name in ("formula_candidates.json", "training_history.json"):
         p = OUTPUT_DIR / name
         if p.exists():
             print(f"\n== {name} ==")
-            print(p.read_text(encoding="utf-8")[:800])
+            print(p.read_text(encoding="utf-8")[:1200])
 
 
 def main():

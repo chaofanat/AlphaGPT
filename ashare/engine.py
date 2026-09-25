@@ -7,8 +7,10 @@
   中性化链——MAD→z→行业+log市值→残差z，见 ashare/preprocess.py）
 - 成本控制：截面 RankIC 含排序，每步随机抽 DATES_PER_STEP 个网格日估 reward
   （REINFORCE 本就随机，日期子样可接受）
-- 时间外纪律（Phase 2 核心）：网格日 < TRAIN_END 才进入训练 reward；
-  终选 top-K 按样本外段（>= TRAIN_END）的 ICIR 裁决，样本内指标仅作参考。
+- 时间外纪律：网格日 < TRAIN_END 才进入训练 reward；训练结束后候选逐条在
+  样本外段（>= TRAIN_END，搜索全程不可见）过一次性出生检验门槛（IC/t/
+  分年一致/分层单调），不做 16 选 1 —— 过门槛者全部作为因子定义交付，
+  相似性去重与进出池由消费方（GMtest 因子池）负责（见 DESIGN.md）。
 
 REINFORCE 主循环不变：批量采样公式 → 栈机执行 → IC 评分 →
 advantage 归一化加权 log-prob → AdamW 更新 + LoRD 低秩衰减。
@@ -22,10 +24,12 @@ from torch.distributions import Categorical
 from tqdm import tqdm
 
 from .alphagpt import AlphaGPT, NewtonSchulzLowRankDecay
-from .config import (BATCH_SIZE, CONSTANT_REWARD, COST_ROUND_TRIP_PCT,
-                     DATES_PER_STEP, DEVICE, ILLEGAL_REWARD, MAX_FORMULA_LEN,
-                     OUTPUT_DIR, REWARD_MODE, SEED, TRAIN_END, TRAIN_STEPS)
-from .evaluator import ICEvaluator, icir
+from .config import (BATCH_SIZE, BIRTH_MIN_IC, BIRTH_MIN_MONO,
+                     BIRTH_MIN_TSTAT, BIRTH_YEARLY_WIN_MIN, CONSTANT_REWARD,
+                     COST_ROUND_TRIP_PCT, DATES_PER_STEP, DEVICE,
+                     ILLEGAL_REWARD, MAX_FORMULA_LEN, OUTPUT_DIR, REWARD_MODE,
+                     SEED, TRAIN_END, TRAIN_STEPS)
+from .evaluator import ICEvaluator, ic_tstat, icir
 from .materialize import load_panel
 from .vocab import FORMULA_VOCAB
 from .vm import StackVM
@@ -164,84 +168,129 @@ class AlphaEngine:
 
     @torch.no_grad()
     def _finalize(self):
-        """top-K 分段终评：样本外（>= TRAIN_END）ICIR 裁决，落盘最优公式与指标。"""
+        """出生检验：候选逐条在样本外段（>= TRAIN_END，搜索全程不可见）过一次性门槛。
+
+        不做 16 选 1（定位 A 残留，见 DESIGN.md）：过门槛的候选全部作为因子定义
+        交付，相似性去重与进出池是消费方（GMtest 因子池）的职责。"""
         if not self.top_formulas:
             print("⚠️ 未产生任何合法公式")
             return
-        candidates = [formula for formula, _ in self.top_formulas]  # 榜内已按公式去重
-
         reports = []
-        for formula in candidates:
+        for formula, rew in self.top_formulas:
             res = self.vm.execute(formula, self.features)
             if res is None:
                 continue
-            rep = self._segment_report(res)
-            if rep is not None:
-                reports.append((formula, rep))
+            rep = {"formula": list(formula), "leaderboard_reward": rew,
+                   "train": self._seg_metrics(res, self.train_dates),
+                   "test": self._seg_metrics(res, self.test_dates)}
+            if self.test_dates:
+                rep["test"]["yearly"] = self._yearly_ic(res, self.test_dates)
+            rep["gate"] = self._birth_gate(rep)
+            reports.append(rep)
         if not reports:
-            print("⚠️ top-K 公式终评全部失败")
+            print("⚠️ 候选终评全部失败")
             return
 
-        # 裁决序：样本外 ICIR > 样本外 IC > 样本内 ICIR（无样本外段时的降级链）
-        def verdict(rep):
-            te, tr = rep["test"], rep["train"]
-            if te["n"] > 0:
-                return (te["icir"], te["ic"])
-            return (tr["icir"], tr["ic"])
+        # 展示序：过门槛在前，按样本外 t 排序（仅展示，不构成选择）
+        reports.sort(key=lambda r: (not r["gate"]["passed"],
+                                    -(r["test"].get("tstat") or -1e9)))
+        passed = [r for r in reports if r["gate"]["passed"]]
+        self.best_formula = passed[0]["formula"] if passed else None
+        self.best_score = passed[0]["test"]["ic"] if passed else float("nan")
 
-        reports.sort(key=lambda fr: verdict(fr[1]), reverse=True)
-        self.best_formula, best_rep = reports[0]
-        self.best_score = best_rep["test"]["ic"] if best_rep["test"]["n"] > 0 \
-            else best_rep["train"]["ic"]
-
-        print("\n==== 终评分段报告（按样本外 ICIR 排序）====")
-        print(f"{'公式':<58}{'train IC':>9}{'ICIR':>7}{'test IC':>9}{'ICIR':>7}"
-              f"{'净分层%':>8}")
-        for formula, rep in reports:
-            names = " ".join(FORMULA_VOCAB.formula_to_names(formula))
-            te, tr = rep["test"], rep["train"]
-            net = (te["layer_spread"] - COST_ROUND_TRIP_PCT) if te["n"] > 0 else float("nan")
-            print(f"{names[:57]:<58}{tr['ic']:>9.4f}{tr['icir']:>7.2f}"
-                  f"{te['ic']:>9.4f}{te['icir']:>7.2f}{net:>8.2f}")
+        years = sorted({y for r in reports for y in r["test"].get("yearly", {})})
+        print(f"\n==== 出生检验报告（样本外段 {years}，PASS=交付）====")
+        hdr = f"{'公式':<56}{'train IC':>9}{'test IC':>9}{'t':>6}"
+        for y in years:
+            hdr += f"{y[2:]:>6}"
+        hdr += f"{'单调':>6}{'净分层%':>8}{'门槛':>5}"
+        print(hdr)
+        for r in reports:
+            names = " ".join(FORMULA_VOCAB.formula_to_names(r["formula"]))
+            te, tr = r["test"], r["train"]
+            net = te["layer_spread"] - COST_ROUND_TRIP_PCT if te["n"] else float("nan")
+            line = (f"{names[:55]:<56}{tr['ic']:>9.4f}{te['ic']:>9.4f}"
+                    f"{te['tstat']:>6.2f}")
+            for y in years:
+                v = te.get("yearly", {}).get(y, float("nan"))
+                line += f"{v:>+6.2f}"
+            line += (f"{te['layer_mono']:>6.2f}{net:>8.2f}"
+                     f"{'PASS' if r['gate']['passed'] else 'FAIL':>5}")
+            print(line)
+            if not r["gate"]["passed"] and r["gate"]["reasons"]:
+                print(f"{'':>56}└ 未过: {'; '.join(r['gate']['reasons'])}")
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
-            "formula_ids": self.best_formula,
-            "formula": FORMULA_VOCAB.formula_to_names(self.best_formula),
-            "selection": "test_icir" if best_rep["test"]["n"] > 0 else "train_icir",
             "reward_mode": REWARD_MODE,
             "neutralized": self.evaluator.neut is not None,
             "train_end": TRAIN_END,
+            "gate_thresholds": {"min_ic": BIRTH_MIN_IC, "min_tstat": BIRTH_MIN_TSTAT,
+                                "yearly_win_min": BIRTH_YEARLY_WIN_MIN,
+                                "min_mono": BIRTH_MIN_MONO},
             "cost_round_trip_pct": COST_ROUND_TRIP_PCT,
-            "metrics": best_rep,
+            "candidates": reports,
             "feature_names": list(FORMULA_VOCAB.feature_names),
             "operator_names": list(FORMULA_VOCAB.operator_names),
         }
-        (OUTPUT_DIR / "best_ashare_formula.json").write_text(
+        (OUTPUT_DIR / "formula_candidates.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         (OUTPUT_DIR / "training_history.json").write_text(
             json.dumps(self.training_history, ensure_ascii=False), encoding="utf-8")
-        te, tr = best_rep["test"], best_rep["train"]
-        print(f"✓ 训练完成 | 最优公式: {' '.join(payload['formula'])}")
-        print(f"  样本内({tr['n']}日): IC {tr['ic']:.4f} / ICIR {tr['icir']:.2f} | "
-              f"样本外({te['n']}日): IC {te['ic']:.4f} / ICIR {te['icir']:.2f}")
+        print(f"✓ 训练完成 | 候选 {len(reports)} 条，过门槛交付 {len(passed)} 条"
+              f"（formula_candidates.json）")
+        if passed:
+            print(f"  首条: {' '.join(FORMULA_VOCAB.formula_to_names(passed[0]['formula']))}"
+                  f" | test IC {passed[0]['test']['ic']:.4f} / t {passed[0]['test']['tstat']:.2f}")
 
     @torch.no_grad()
-    def _segment_report(self, scores_full) -> dict | None:
-        """单公式分段指标：train/test 各段 IC 均值、ICIR、五分位分层。"""
-        def seg(dates):
-            if not dates:
-                return {"n": 0, "ic": float("nan"), "icir": float("nan"),
-                        "layer_spread": float("nan")}
-            ics = self.evaluator.ic_series(scores_full.unsqueeze(0), dates=dates)[0]
-            ok = torch.isfinite(ics)
-            n = int(ok.sum())
-            ic = float(ics[ok].mean()) if n else float("nan")
-            ir = float(icir(ics)) if n else float("nan")
-            spread = self.evaluator.layer_spread(scores_full, dates)
-            return {"n": n, "ic": ic, "icir": ir, "layer_spread": spread}
+    def _seg_metrics(self, scores_full, dates) -> dict:
+        """单段指标：n / IC / ICIR / t / 分层 spread / 分层单调性。"""
+        if not dates:
+            return {"n": 0, "ic": float("nan"), "icir": float("nan"),
+                    "tstat": float("nan"), "layer_spread": float("nan"),
+                    "layer_mono": float("nan")}
+        ics = self.evaluator.ic_series(scores_full.unsqueeze(0), dates=dates)[0]
+        ok = torch.isfinite(ics)
+        n = int(ok.sum())
+        return {
+            "n": n,
+            "ic": float(ics[ok].mean()) if n else float("nan"),
+            "icir": float(icir(ics)) if n else float("nan"),
+            "tstat": float(ic_tstat(ics)) if n else float("nan"),
+            "layer_spread": self.evaluator.layer_spread(scores_full, dates),
+            "layer_mono": self.evaluator.layer_monotonicity(scores_full, dates),
+        }
 
-        return {"train": seg(self.train_dates), "test": seg(self.test_dates)}
+    @torch.no_grad()
+    def _yearly_ic(self, scores_full, dates) -> dict:
+        """样本外段分年 IC（穿越周期一致性，出生检验口径）。"""
+        out = {}
+        for y in sorted({self.grid_dates[t][:4] for t in dates}):
+            yd = [t for t in dates if self.grid_dates[t][:4] == y]
+            ics = self.evaluator.ic_series(scores_full.unsqueeze(0), dates=yd)[0]
+            ok = torch.isfinite(ics)
+            out[y] = float(ics[ok].mean()) if int(ok.sum()) else float("nan")
+        return out
+
+    def _birth_gate(self, rep) -> dict:
+        """样本外一次性门槛：IC / t / 分年胜率 / 分层单调（阈值见 config）。"""
+        te = rep["test"]
+        fails = []
+        if te["n"] == 0:
+            fails.append("无样本外段")
+        else:
+            if not te["ic"] >= BIRTH_MIN_IC:
+                fails.append(f"IC {te['ic']:.3f}<{BIRTH_MIN_IC}")
+            if not te["tstat"] >= BIRTH_MIN_TSTAT:
+                fails.append(f"t {te['tstat']:.2f}<{BIRTH_MIN_TSTAT}")
+            yearly = te.get("yearly", {})
+            wins = sum(1 for v in yearly.values() if v > 0)
+            if len(yearly) and wins < BIRTH_YEARLY_WIN_MIN:
+                fails.append(f"分年正 {wins}/{len(yearly)}")
+            if not te["layer_mono"] >= BIRTH_MIN_MONO:
+                fails.append(f"单调 {te['layer_mono']:.2f}<{BIRTH_MIN_MONO}")
+        return {"passed": not fails, "reasons": fails}
 
 
 if __name__ == "__main__":

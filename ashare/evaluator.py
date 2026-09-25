@@ -62,6 +62,17 @@ def icir(ics: torch.Tensor) -> torch.Tensor:
     return torch.where(cnt > 0, val, torch.full_like(val, float("nan")))
 
 
+def ic_tstat(ics: torch.Tensor) -> torch.Tensor:
+    """IC 序列 t 统计量 = ICIR×√n（网格日间隔=持有期，窗口无重叠，普通 t 即可）。"""
+    ok = torch.isfinite(ics)
+    cnt = ok.sum(dim=-1).clamp(min=1)
+    mean = torch.where(ok, ics, torch.zeros_like(ics)).sum(dim=-1) / cnt
+    d = torch.where(ok, ics - mean[..., None], torch.zeros_like(ics))
+    std = torch.sqrt((d * d).sum(dim=-1) / cnt)
+    t = mean / (std + 1e-9) * torch.sqrt(cnt.to(torch.float32))
+    return torch.where(cnt > 1, t, torch.full_like(t, float("nan")))
+
+
 class ICEvaluator:
     """从物化面板构建 IC 评估器。labels NaN 与 mask 外的样本不参与。
 
@@ -157,12 +168,9 @@ class ICEvaluator:
         return torch.where(torch.isfinite(mean), mean, torch.full_like(mean, -10.0))
 
     @torch.no_grad()
-    def layer_spread(self, scores, dates) -> float:
-        """五分位 top-bottom 平均池内超额（百分比），对 dates 取均值。
-
-        scores [N, Tg] 单公式全日期分数；排序在原始分数上（中性化不改变
-        单调变换下的分层——如启用中性化，此处与 IC 口径一致的秩）。"""
-        spreads = []
+    def _quintile_means(self, scores, dates) -> torch.Tensor | None:
+        """逐日五分位层均池内超额（分数过中性化后分层），对 dates 取均值 → [5]。"""
+        rows = []
         for t in dates:
             idx = self.date_idx[t]
             s = scores[idx, t]
@@ -171,8 +179,30 @@ class ICEvaluator:
             e = self.excess[idx, t]
             r = torch.argsort(torch.argsort(s)).float()
             q = torch.clamp((r / len(idx) * 5).long(), 0, 4)
-            spreads.append((e[q == 4].mean() - e[q == 0].mean()).item())
-        return float(np.nanmean(spreads)) if spreads else float("nan")
+            rows.append(torch.stack([e[q == k].mean() for k in range(5)]))
+        if not rows:
+            return None
+        return torch.stack(rows).mean(dim=0)
+
+    @torch.no_grad()
+    def layer_spread(self, scores, dates) -> float:
+        """五分位 top-bottom 平均池内超额（百分比），对 dates 取均值。
+
+        scores [N, Tg] 单公式全日期分数；排序在原始分数上（中性化不改变
+        单调变换下的分层——如启用中性化，此处与 IC 口径一致的秩）。"""
+        means = self._quintile_means(scores, dates)
+        if means is None:
+            return float("nan")
+        return float(means[4] - means[0])
+
+    @torch.no_grad()
+    def layer_monotonicity(self, scores, dates) -> float:
+        """分层单调性：层序(1..5) 与层均超额的 Spearman（穿越层级的秩序性）。"""
+        means = self._quintile_means(scores, dates)
+        if means is None or not bool(torch.isfinite(means).all()):
+            return float("nan")
+        order = torch.arange(1, 6, device=means.device, dtype=torch.float32)
+        return float(_pearson(order.unsqueeze(0), means.unsqueeze(0), 5)[0])
 
 
 def evaluator_from_panel(panel=None):
